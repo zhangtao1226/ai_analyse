@@ -945,6 +945,15 @@ async def review(review_request: ReviewRequest, background_tasks: BackgroundTask
         f"keywordRecords={sum(1 for item in data if item.keywords)}, "
         f"attachments={sum(len(item.files) for item in data)}"
     )
+    logger.info(
+        "接收到审核请求完整内容:\n"
+        + json.dumps(
+            review_request.model_dump(by_alias=True),
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+    )
 
     callback_url = settings.review_callback_url
 
@@ -1149,6 +1158,15 @@ def run_review_in_process(
         logger.error(f"[{aiAuditId}] 审核失败: {e}")
 
     finally:
+        logger.info(
+            f"[{aiAuditId}] 审核返回完整数据:\n"
+            + json.dumps(
+                result_payload,
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+        )
         _notify_review_callback(callback_url, result_payload)
 
 
@@ -1240,6 +1258,24 @@ def prepare_archive_contents(instructions: list, model_type: str) -> list:
         logger.info(
             f"档案{enriched.get('arid', '')}正文准备完成，字符数={len(enriched['content'])}，"
             f"检索条款数={len(enriched['retrieved_rules'])}"
+        )
+        logger.info(
+            f"档案{enriched.get('arid', '')}送入模型的完整审核内容:\n"
+            + json.dumps(
+                {
+                    "arid": enriched.get("arid", ""),
+                    "题名": enriched.get("title", ""),
+                    "成文日期": enriched.get("date_time", ""),
+                    "keywords": enriched.get("keywords") or [],
+                    "audit_result": enriched.get("audit_result") or "",
+                    "files": enriched.get("files") or [],
+                    "content": enriched.get("content") or "",
+                    "retrieved_rules": enriched.get("retrieved_rules") or [],
+                },
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
         )
         prepared.append(enriched)
     return prepared

@@ -412,6 +412,8 @@ class ArchiveReviewer:
 
     _SYSTEM_PROMPT = (
         "你是专业的中文档案审核助手。请只输出合法 JSON，不要输出解释性前缀、Markdown 或英文。"
+        "审核依据和思考过程必须全部使用简体中文，禁止出现任何英文字母；"
+        "必须把英文概念翻译成中文后再输出。"
     )
 
     def _build_user_content(self, archive_item: dict) -> str:
@@ -450,7 +452,10 @@ class ArchiveReviewer:
         else:
             rule_context = "（未检索到候选规范条款）"
 
-        lang_prefix = "【语言要求】所有输出内容必须使用简体中文，禁止出现英文。\n\n"
+        lang_prefix = (
+            "【语言要求】所有输出内容必须使用简体中文，禁止出现任何英文单词、"
+            "英文字母或中英文混写；思考过程必须是完整的简体中文句子。\n\n"
+        )
 
         if self.model_type == "hk":
             keywords, keyword_result = normalize_keyword_review_signal(
@@ -677,6 +682,23 @@ class ArchiveReviewer:
             return f"{self.required_basis}，{key}"
         return f"{self.required_basis}，根据档案标题和内容特征，综合判定为【{result}】"
 
+    @staticmethod
+    def _sanitize_thinking(value) -> str:
+        """最终输出前移除模型夹带的英文，确保思考过程为简体中文。"""
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        text = re.sub(r"[A-Za-z]+", "", text)
+        text = re.sub(
+            r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])",
+            "",
+            text,
+        )
+        text = re.sub(r"\s+([，。；：、！？])", r"\1", text)
+        text = re.sub(r"([，。；：、！？])\s+", r"\1", text)
+        text = text.strip(" ，,；;：:")
+        if not re.search(r"[\u3400-\u9fff]", text):
+            return "已根据档案题名、正文、关键字及候选规范条款完成综合审核。"
+        return text
+
     def _is_valid_result_value(self, value: str) -> bool:
         value = str(value).strip()
         if self.model_type == "jd":
@@ -828,6 +850,7 @@ class ArchiveReviewer:
         thinking, body = self._split_think_and_body(raw_text)
         if not thinking:
             thinking = self._extract_thinking(raw_text, fallback_body=body)
+        thinking = self._sanitize_thinking(thinking)
         logger.info(
             f"思考过程({len(thinking)}字): "
             f"{thinking[:120]}{'...' if len(thinking) > 120 else ''}"
@@ -858,6 +881,7 @@ class ArchiveReviewer:
         else:
             thinking = parsed["思考过程"]
 
+        parsed["思考过程"] = self._sanitize_thinking(parsed.get("思考过程"))
         logger.info(
             f"思考过程({len(parsed['思考过程'])}字): "
             f"{parsed['思考过程'][:120]}..."
@@ -959,19 +983,32 @@ class ArchiveReviewer:
                     # 规则引擎和模型都不能覆盖客户端关键字预审给出的确定结论。
                     result = self._apply_keyword_decision(result, item)
                     result = self._apply_missing_content_guard(result, item)
+                    result["思考过程"] = self._sanitize_thinking(
+                        result.get("思考过程")
+                    )
                     logger.info(f"\n--- 档案 ID: {item.get('arid', 'N/A')} ---")
                     if not isinstance(result['思考过程'], str):
                         thinking = ' '.join(result['思考过程'])
                     else:
                         thinking = result['思考过程']
 
-                    all_results.append({
+                    response_item = {
                         "arid":     item.get("arid", ""),
                         "jg":       result["审核结果"],
                         "yj":       result["审核依据"],
                         "zxd":      result["置信度"],
                         "thinking": thinking,
-                    })
+                    }
+                    all_results.append(response_item)
+                    logger.info(
+                        "单条审核返回完整数据:\n"
+                        + json.dumps(
+                            response_item,
+                            ensure_ascii=False,
+                            indent=2,
+                            default=str,
+                        )
+                    )
 
                 logger.info(f"批次耗时: {time.time() - batch_start:.2f}s")
 

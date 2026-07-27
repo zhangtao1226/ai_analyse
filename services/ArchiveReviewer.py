@@ -32,9 +32,9 @@ os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = '1'
 os.environ['TOKENIZERS_PARALLELISM']            = 'true'
 os.environ['CUDA_VISIBLE_DEVICES']              = ''
 
-_MAX_INPUT_LEN  = int(os.environ.get("REVIEW_MAX_INPUT_LEN", "8192"))
+_MAX_INPUT_LEN  = int(os.environ.get("REVIEW_MAX_INPUT_LEN", "4096"))
 _MAX_CONTENT_CHARS = int(os.environ.get("REVIEW_MAX_CONTENT_CHARS", "4000"))
-_MAX_NEW_TOKENS = 2048
+_MAX_NEW_TOKENS = int(os.environ.get("REVIEW_MAX_NEW_TOKENS", "512"))
 _DTYPE          = torch.float16
 
 _STOP_STRINGS = [
@@ -46,6 +46,36 @@ _STOP_STRINGS = [
 ]
 
 SPECIAL_TOKENS = _STOP_STRINGS + ['<s>', '<pad>', '<unk>']
+
+def normalize_keyword_review_signal(archive_item: dict, model_type: str) -> tuple[list[str], str]:
+    """规范化划控关键字及预审结果；鉴定审核不使用该信号。"""
+    if model_type != "hk":
+        return [], ""
+
+    raw_keywords = archive_item.get("keywords")
+    if raw_keywords is None:
+        raw_keywords = []
+    if not isinstance(raw_keywords, list):
+        raise ValueError("划控审核字段keywords必须是字符串数组")
+
+    keywords = []
+    seen = set()
+    for value in raw_keywords:
+        if not isinstance(value, str):
+            raise ValueError("划控审核字段keywords中的元素必须是字符串")
+        keyword = value.strip()
+        if keyword and keyword not in seen:
+            seen.add(keyword)
+            keywords.append(keyword)
+
+    # 没有有效关键字时，预审结果必须清空，防止复用上一次规则结果。
+    if not keywords:
+        return [], ""
+
+    keyword_result = str(archive_item.get("audit_result") or "").strip()
+    if keyword_result not in ("开放", "控制"):
+        raise ValueError("划控审核存在keywords时，audit_result必须为开放或控制")
+    return keywords, keyword_result
 
 warnings.filterwarnings("ignore")
 
@@ -423,12 +453,30 @@ class ArchiveReviewer:
         lang_prefix = "【语言要求】所有输出内容必须使用简体中文，禁止出现英文。\n\n"
 
         if self.model_type == "hk":
+            keywords, keyword_result = normalize_keyword_review_signal(
+                archive_item,
+                self.model_type,
+            )
+            if keywords:
+                keyword_context = (
+                    f"【关键字规则预审】命中关键字：{'、'.join(keywords)}\n"
+                    f"关键字预审结果：{keyword_result}\n"
+                    f"审核结果已经由关键字规则确定为【{keyword_result}】，不得改成其他结果。"
+                    "请结合命中关键字、档案正文和候选规范条款，生成审核依据、"
+                    "思考过程和置信度，并在JSON的审核结果字段中原样返回该结论。\n\n"
+                )
+            else:
+                keyword_context = (
+                    "【关键字规则预审】未提供或未命中关键字，"
+                    "请结合档案内容和候选规范条款独立判断开放或控制。\n\n"
+                )
             return (
                 lang_prefix +
                 "你是档案划控专家。对下面的档案进行开放/控制审核。\n\n"
                 "【审核标准】依据《连云港市档案馆延期开放档案标准及范围（试用）》\n"
                 "- 控制：含机密/秘密/内部/人事/工资/涉密/敏感/个人信息等字样\n"
                 "- 开放：公开/通知/公告/总结/报告/批复/规划等常规公文\n\n"
+                + keyword_context +
                 "【输出要求】只输出一行 JSON，字段顺序为：审核结果、审核依据、置信度、思考过程。\n"
                 '{"审核结果":"开放或控制",'
                 '"审核依据":"依据《连云港市档案馆延期开放档案标准及范围（试用）》，<具体理由>",'
@@ -487,7 +535,10 @@ class ArchiveReviewer:
     @staticmethod
     def _apply_missing_content_guard(result: dict, archive_item: dict) -> dict:
         """无正文时降低结论强度，防止仅凭题名产生过高置信度。"""
-        if str(archive_item.get("content") or "").strip():
+        if (
+            str(archive_item.get("content") or "").strip()
+            or archive_item.get("keywords")
+        ):
             return result
 
         guarded = dict(result)
@@ -505,6 +556,33 @@ class ArchiveReviewer:
         if limitation not in thinking:
             guarded["思考过程"] = f"{thinking} {limitation}".strip()
         return guarded
+
+    def _apply_keyword_decision(self, result: dict, archive_item: dict) -> dict:
+        """关键字规则命中时锁定划控结论，模型仅补充可解释字段。"""
+        keywords, keyword_result = normalize_keyword_review_signal(
+            archive_item,
+            self.model_type,
+        )
+        if not keywords:
+            return result
+
+        forced = dict(result)
+        model_result = str(forced.get("审核结果") or "").strip()
+        if model_result != keyword_result:
+            logger.warning(
+                f"模型结论与关键字预审不一致，使用关键字结果: "
+                f"model={model_result}, keyword={keyword_result}"
+            )
+        forced["审核结果"] = keyword_result
+
+        signal = f"命中关键字【{'、'.join(keywords)}】，关键字预审结果为【{keyword_result}】"
+        basis = str(forced.get("审核依据") or "").strip()
+        if signal not in basis:
+            forced["审核依据"] = f"{signal}；{basis}" if basis else signal
+        thinking = str(forced.get("思考过程") or "").strip()
+        if signal not in thinking:
+            forced["思考过程"] = f"{signal}。{thinking}" if thinking else signal
+        return forced
 
     def _tokenize_batch(self, texts: List[str], max_length: int = _MAX_INPUT_LEN) -> dict:
         inputs = self.tokenizer(
@@ -878,6 +956,8 @@ class ArchiveReviewer:
                         result,
                         item.get("retrieved_rules") or [],
                     )
+                    # 规则引擎和模型都不能覆盖客户端关键字预审给出的确定结论。
+                    result = self._apply_keyword_decision(result, item)
                     result = self._apply_missing_content_guard(result, item)
                     logger.info(f"\n--- 档案 ID: {item.get('arid', 'N/A')} ---")
                     if not isinstance(result['思考过程'], str):

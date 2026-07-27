@@ -114,8 +114,13 @@ class RuleKnowledgeRetriever:
             "title", "date_time", "archive_category", "organization_problem",
             "fonds_no", "document_no", "responsible_org",
         ))
+        keywords = " ".join(
+            str(keyword).strip()
+            for keyword in (archive.get("keywords") or [])
+            if str(keyword).strip()
+        )
         content = str(archive.get("content") or "")
-        query = f"{metadata}\n{content[:8000]}"
+        query = f"{metadata}\n{keywords}\n{content[:8000]}"
         query_terms = _char_ngrams(query)
         if not query_terms:
             return []

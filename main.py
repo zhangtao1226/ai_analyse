@@ -40,6 +40,7 @@ from peft import PeftModel
 from fastapi import FastAPI, Form, File, UploadFile, HTTPException, Request
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from schemas.ResponseModel import BaseResponse, ErrorResponse
+from schemas.ReviewRequest import ReviewRequest
 
 from core.config import settings
 from core.LoggerDetector import logger
@@ -48,7 +49,7 @@ from core.TrainingProgress import TrainingProgressStore
 from utils.ResponseUtil import ResponseUtil
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from services.NewLoRATrainModels import LoRATrainModelNPU
-from services.ArchiveReviewer import ArchiveReviewer
+from services.ArchiveReviewer import ArchiveReviewer, normalize_keyword_review_signal
 from services.ArchiveContentExtractor import ArchiveContentExtractor
 from services.PaddleOCRServices import PaddleOCRServices
 from services.ReviewKnowledgeService import RuleKnowledgeRetriever
@@ -925,7 +926,7 @@ def _queue_position(aiAuditId: str) -> int:
             return 0
 
 @app.post("/review")
-async def review(request: Request, background_tasks: BackgroundTasks):
+async def review(review_request: ReviewRequest, background_tasks: BackgroundTasks):
     """
     ai审核
     :param modelId:
@@ -933,22 +934,20 @@ async def review(request: Request, background_tasks: BackgroundTasks):
     :return:
     """
     logger.info("开始 AI 进行审核·······")
-    json_data = await request.json()
+    modelId = review_request.model_id
+    modelType = review_request.model_type
+    data = review_request.data
+    aiAuditId = review_request.ai_audit_id
 
-    print(f"接收到审核数据:{json_data}")
+    logger.info(
+        f"接收到审核请求: aiAuditId={aiAuditId}, modelId={modelId}, "
+        f"modelType={modelType}, records={len(data)}, "
+        f"keywordRecords={sum(1 for item in data if item.keywords)}, "
+        f"attachments={sum(len(item.files) for item in data)}"
+    )
 
-    modelId     = json_data["modelId"]
-    modelType   = json_data["modelType"]
-    data        = json_data["data"]
-    aiAuditId   = json_data["aiAuditId"]
+    callback_url = settings.review_callback_url
 
-    callback_url = r'http://192.168.10.40:8080/product-archives/AIAuditWriteBack.writeback.erren'
-
-
-    if not modelId:
-        return ResponseUtil.error(message="模型ID不可为空")
-    if not data:
-        return ResponseUtil.error(message="未接受到任何审核数据!")
 
     try:
         logger.info("获取模型信息······")
@@ -967,27 +966,30 @@ async def review(request: Request, background_tasks: BackgroundTasks):
         logger.info(f"模型类型与模型不匹配; AI审核类型:{modelType}; 模型类型: {model_info['model_type']}")
         return ResponseUtil.error(message="模型类型与模型不匹配！")
 
+    instructions = []
+    for item in data:
+        item_dict = {
+            "arid": item.arid,
+            "title": item.title,
+            "date_time": item.date_time,
+            # 附件正文在后台进程中解析，避免请求接口被下载/OCR阻塞。
+            "files": item.files,
+            "content": item.content,
+            "archive_category": item.archive_category,
+            "organization_problem": item.organization_problem,
+            "fonds_no": item.fonds_no,
+            "document_no": item.document_no,
+            "responsible_org": item.responsible_org,
+            "retention_period": item.retention_period,
+            "archive_year": item.archive_year,
+            "keywords": item.keywords,
+            "audit_result": item.audit_result,
+        }
+        instructions.append(item_dict)
+
     if not _add_task(aiAuditId):
         logger.warning(f"[任务 {aiAuditId}] 重复提交, 当前任务仍在审核中······")
         return ResponseUtil.error(message=f"[任务 {aiAuditId}] 重复提交, 当前任务仍在审核中······")
-
-    instructions = []
-    for item in data:
-        item_dict = dict()
-        item_dict["arid"] = item["arid"]
-        item_dict["title"] = item["题名"]
-        item_dict["date_time"] = item['成文日期']
-        # 附件正文在后台进程中解析，避免请求接口被下载/OCR阻塞。
-        item_dict["files"] = item.get("files") or []
-        item_dict["archive_category"] = item.get("门类", "")
-        item_dict["organization_problem"] = item.get("机构或问题", "")
-        item_dict["fonds_no"] = item.get("全宗号", "")
-        item_dict["document_no"] = item.get("文号", "")
-        item_dict["responsible_org"] = item.get("责任者", "")
-        item_dict["retention_period"] = item.get("保管期限", "")
-        item_dict["archive_year"] = item.get("归档年度", "")
-
-        instructions.append(item_dict)
 
     pos = _enqueue(aiAuditId)
 
@@ -1043,7 +1045,7 @@ def _load_or_reuse_reviewer(
     reviewer = ArchiveReviewer(
         base_model_path=base_model_path,
         lora_model_path=lora_model_path,
-        batch_size=8,
+        batch_size=max(1, int(os.environ.get("REVIEW_BATCH_SIZE", "1"))),
         model_type=model_type,
         npu_device_ids=[0],
     )
@@ -1147,15 +1149,50 @@ def run_review_in_process(
         logger.error(f"[{aiAuditId}] 审核失败: {e}")
 
     finally:
+        _notify_review_callback(callback_url, result_payload)
+
+
+def _notify_review_callback(callback_url: str, result_payload: dict) -> bool:
+    """发送审核结果；网络、HTTP和明确的业务失败均按指数退避重试。"""
+    ai_audit_id = str(result_payload.get("aiAuditId") or "")
+    max_attempts = max(1, int(settings.review_callback_max_attempts))
+    retry_delay = max(0.0, float(settings.review_callback_retry_delay_seconds))
+    last_error = None
+
+    for attempt in range(1, max_attempts + 1):
         try:
-            resp = requests.post(
+            response = requests.post(
                 callback_url,
-                data=json.dumps(result_payload, ensure_ascii=False, indent=4),
-                timeout=40,
+                data=json.dumps(result_payload, ensure_ascii=False),
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                timeout=float(settings.review_callback_timeout_seconds),
             )
-            logger.info(f"[{aiAuditId}] 回调完成 status={resp.status_code}")
-        except Exception as cb_err:
-            logger.error(f"[{aiAuditId}] 回调失败: {cb_err}")
+            if not 200 <= response.status_code < 300:
+                raise RuntimeError(f"HTTP状态异常: {response.status_code}")
+            try:
+                response_payload = response.json()
+            except Exception:
+                response_payload = None
+            if isinstance(response_payload, dict) and "code" in response_payload:
+                business_code = str(response_payload["code"])
+                if business_code not in {"0", "200"}:
+                    raise RuntimeError(f"业务状态异常: code={business_code}")
+            logger.info(
+                f"[{ai_audit_id}] 审核回调成功: "
+                f"attempt={attempt}/{max_attempts}, status={response.status_code}"
+            )
+            return True
+        except Exception as error:
+            last_error = error
+            logger.warning(
+                f"[{ai_audit_id}] 审核回调失败: "
+                f"attempt={attempt}/{max_attempts}, error={error}"
+            )
+            if attempt < max_attempts and retry_delay > 0:
+                time.sleep(retry_delay * (2 ** (attempt - 1)))
+
+    logger.error(f"[{ai_audit_id}] 审核回调最终失败: {last_error}")
+    return False
 
 
 def _get_content_extractor() -> ArchiveContentExtractor:

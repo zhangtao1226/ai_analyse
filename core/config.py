@@ -40,6 +40,14 @@ class Settings(BaseSettings):
     training_callback_pending_dir: str = f"{root_path}/output/training_callbacks/"
     training_callback_retry_interval_seconds: int = 60
 
+    # 档案审核结果回调；与训练回调分开配置。
+    review_callback_url: str = (
+        "http://192.168.10.40:8080/product-archives/AIAuditWriteBack.writeback.erren"
+    )
+    review_callback_timeout_seconds: float = 40.0
+    review_callback_max_attempts: int = 3
+    review_callback_retry_delay_seconds: float = 2.0
+
     # 训练数据集
     train_dataset_path: str = f"{root_path}/core/datasets/train_datasets.jsonl"
 
@@ -103,7 +111,7 @@ class Settings(BaseSettings):
     training_min_label_types: int = 2
 
     # 业务系统附件下载地址。附件 url 为相对路径时拼接该地址；可由环境变量覆盖。
-    file_download_base_url: str = "http://192.168.10.40:8080"
+    file_download_base_url: str = "http://192.168.10.40:8080/product-archives/"
     file_download_timeout: int = 60
 
     # 日志文件配置信息

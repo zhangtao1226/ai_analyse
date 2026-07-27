@@ -162,35 +162,27 @@ class ArchiveContentExtractor:
             if data_uri:
                 payload, content_type = data_uri
                 return self.extract_binary(payload, content_type, "inline")
-            # 新训练集接口协议：出现filename字段时，content固定表示文件Base64，
-            # 即使filename为空也不能再把content当作普通OCR文本。
-            if "filename" in attachment:
-                if content.strip().lower() in {"", "base64", "<base64>", "null", "none"}:
-                    raise ValueError("files.content是Base64占位符或空值，未提供真实文件内容")
-                payload = self._decode_base64(content)
-                return self.extract_binary(
-                    payload,
-                    self._attachment_content_type(attachment),
-                    self._attachment_name(attachment),
-                )
             encoding = str(attachment.get("encoding") or "").lower()
-            if encoding in {"base64", "b64"}:
+            cleaned_content = self._clean_text(content)
+            if cleaned_content and encoding in {"base64", "b64"}:
                 payload = self._decode_base64(content)
                 return self.extract_binary(
                     payload,
                     self._attachment_content_type(attachment),
                     self._attachment_name(attachment),
                 )
-            payload = self._try_decode_file_base64(content, attachment)
-            if payload is not None:
-                return self.extract_binary(
-                    payload,
-                    self._attachment_content_type(attachment),
-                    self._attachment_name(attachment),
-                )
-            text = self._clean_text(content)
-            if text:
-                return text, "inline"
+            if cleaned_content and cleaned_content.lower() not in {"base64", "<base64>"}:
+                # 兼容训练接口的Base64文件和审核接口的OCR正文。只有内容确实
+                # 能解码为已声明/可识别的文件时才按二进制处理，避免误判正文。
+                payload = self._try_decode_file_base64(content, attachment)
+                if payload is not None:
+                    return self.extract_binary(
+                        payload,
+                        self._attachment_content_type(attachment),
+                        self._attachment_name(attachment),
+                    )
+                # 审核请求已携带正文时直接使用，绝不再下载同一附件。
+                return cleaned_content, "inline"
         elif isinstance(content, (bytes, bytearray, memoryview)):
             return self.extract_binary(
                 bytes(content),
@@ -307,7 +299,20 @@ class ArchiveContentExtractor:
             return url
         if not self.file_download_base_url:
             raise ValueError("相对附件URL缺少file_download_base_url配置")
-        return urljoin(self.file_download_base_url.rstrip("/") + "/", url.lstrip("/"))
+        base_url = self.file_download_base_url.rstrip("/") + "/"
+        relative_url = url.lstrip("/")
+        base = urlparse(base_url)
+        base_path = base.path.strip("/")
+
+        # 调用方可能传 /FileUpload...，也可能已经包含 /product-archives/。
+        # 已包含应用上下文时从站点根目录拼接，避免上下文路径重复。
+        if base_path and (
+            relative_url == base_path
+            or relative_url.startswith(f"{base_path}/")
+        ):
+            site_root = f"{base.scheme}://{base.netloc}/"
+            return urljoin(site_root, relative_url)
+        return urljoin(base_url, relative_url)
 
     def download_attachment(self, url: str) -> Tuple[bytes, str, str]:
         resolved_url = self.resolve_download_url(url)
